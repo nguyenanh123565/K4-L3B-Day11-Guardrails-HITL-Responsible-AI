@@ -8,7 +8,10 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 from core.config import (
@@ -49,7 +52,43 @@ class OpenAIRunner:
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        return OpenAI(max_retries=0, **(self.client_kwargs or {}))
+
+    @staticmethod
+    def _retry_after_seconds(exc) -> float | None:
+        """Read provider delay from the HTTP header, then OpenRouter metadata."""
+        response = getattr(exc, "response", None)
+        header = response.headers.get("Retry-After") if response is not None else None
+        if header:
+            try:
+                return max(0.0, float(header))
+            except ValueError:
+                try:
+                    date = parsedate_to_datetime(header)
+                    return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if response is not None:
+            try:
+                delay = response.json()["error"]["metadata"]["retry_after_seconds"]
+                return max(0.0, float(delay))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                pass
+        return None
+
+    async def _create_completion(self, client, request: dict):
+        from openai import RateLimitError
+
+        for retry in range(4):  # initial attempt plus at most three retries
+            try:
+                return await asyncio.to_thread(client.chat.completions.create, **request)
+            except RateLimitError as exc:
+                if retry == 3:
+                    raise
+                delay = self._retry_after_seconds(exc)
+                delay = delay if delay is not None else 2 ** retry
+                print(f"[429 retry {retry + 1}/3] waiting {delay:g}s", flush=True)
+                await asyncio.sleep(delay)
 
     async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
         for hook in self.input_hooks:
@@ -62,14 +101,31 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": agent.instruction},
                 {"role": "user", "content": user_message},
             ],
-            temperature=self.temperature,
-        )
+            "temperature": self.temperature,
+        }
+        try:
+            completion = await self._create_completion(client, request)
+        except Exception as exc:
+            # OpenRouter currently publishes this same Liquid model under :free.
+            # Keep the lab's locked model as the primary ID and retry only when
+            # its endpoint is explicitly unavailable.
+            from openai import NotFoundError
+
+            if not (
+                self.provider == "openrouter"
+                and self.model == get_blue_model()
+                and isinstance(exc, NotFoundError)
+                and f"No endpoints found for {self.model}" in str(exc)
+            ):
+                raise
+            request["model"] = f"{self.model}:free"
+            completion = await self._create_completion(client, request)
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
